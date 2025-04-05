@@ -14,7 +14,7 @@ type Client struct {
 
 type ClientOption func(*Client)
 
-func NewClient(zkServers []string, opts ...ClientOption) *Client {
+func NewZkClient(zkServers []string, opts ...ClientOption) *Client {
 	configService, err := NewConfigService(zkServers, "/config")
 	if err != nil {
 		panic(err)
@@ -22,8 +22,6 @@ func NewClient(zkServers []string, opts ...ClientOption) *Client {
 
 	client := &Client{
 		configService: configService,
-		Environment:   "",
-		Namespace:     "",
 	}
 
 	for _, opt := range opts {

@@ -30,8 +30,8 @@ type ConfigStructBinding struct {
 }
 
 type ConfigService interface {
-	Get(ctx context.Context, path string) (ConfigValue, error)
-	Set(ctx context.Context, path string, value any) error
+	Get(ctx context.Context, path string, watch ...bool) (ConfigValue, error)
+	Set(ctx context.Context, path string, value any, watch ...bool) error
 	Delete(ctx context.Context, path string) error
 	Exists(ctx context.Context, path string) (bool, error)
 	List(ctx context.Context, path string) ([]string, error)
@@ -41,11 +41,11 @@ type ConfigService interface {
 
 	GetEffective(ctx context.Context, path string, env string, namespace string) (ConfigValue, error)
 
-	SetBatch(ctx context.Context, configs map[string]any) error
-	GetBatch(ctx context.Context, paths []string) (map[string]ConfigValue, error)
+	SetBatch(ctx context.Context, configs map[string]any, watch ...bool) error
+	GetBatch(ctx context.Context, paths []string, watch ...bool) (map[string]ConfigValue, error)
 
 	Export(ctx context.Context, rootPath string, env string, namespace string) (map[string]ConfigValue, error)
-	Import(ctx context.Context, configs map[string]ConfigValue) error
+	Import(ctx context.Context, configs map[string]ConfigValue, watch ...bool) error
 
 	BindStruct(ctx context.Context, path string, env string, namespace string, structPtr any) (*ConfigStructBinding, error)
 	BindStructWithCallback(ctx context.Context, path string, env string, namespace string, structPtr any, callback func(any)) (*ConfigStructBinding, error)

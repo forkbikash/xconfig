@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/go-zookeeper/zk"
 	"github.com/spf13/viper"
 )
@@ -37,7 +38,7 @@ type subscription struct {
 
 // NewConfigService creates a new configuration service
 func NewConfigService(zkServers []string, basePath string) (ConfigService, error) {
-	conn, _, err := zk.Connect(zkServers, time.Second*10)
+	conn, _, err := zk.Connect(zkServers, time.Second*20)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to ZooKeeper: %w", err)
 	}
@@ -49,7 +50,7 @@ func NewConfigService(zkServers []string, basePath string) (ConfigService, error
 	}
 
 	if !exists {
-		_, err = conn.Create(basePath, []byte{}, 0, zk.WorldACL(zk.PermAll))
+		_, err = conn.Create(basePath, nil, 0, zk.WorldACL(zk.PermAll))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create base path: %w", err)
 		}
@@ -59,6 +60,7 @@ func NewConfigService(zkServers []string, basePath string) (ConfigService, error
 		zkConn:           conn,
 		baseZkPath:       basePath,
 		subscriptions:    make(map[string]subscription),
+		structBindings:   make(map[*ConfigStructBinding]bool),
 		notificationChan: make(chan ConfigChangeEvent, 100),
 		closeChan:        make(chan struct{}),
 	}
@@ -186,7 +188,7 @@ func (c *configServiceImpl) watchZkNode(path string) error {
 }
 
 // Get retrieves a configuration value by path
-func (c *configServiceImpl) Get(ctx context.Context, path string) (ConfigValue, error) {
+func (c *configServiceImpl) Get(ctx context.Context, path string, watch ...bool) (ConfigValue, error) {
 	zkPath := c.getZkPath(path)
 
 	data, _, err := c.zkConn.Get(zkPath)
@@ -202,11 +204,15 @@ func (c *configServiceImpl) Get(ctx context.Context, path string) (ConfigValue, 
 		return ConfigValue{}, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	if len(watch) > 0 && watch[0] {
+		_ = c.watchZkNode(path)
+	}
+
 	return value, nil
 }
 
 // Set creates or updates a configuration value
-func (c *configServiceImpl) Set(ctx context.Context, path string, value any) error {
+func (c *configServiceImpl) Set(ctx context.Context, path string, value any, watch ...bool) error {
 	zkPath := c.getZkPath(path)
 
 	// Determine value type
@@ -243,8 +249,10 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any) err
 		return fmt.Errorf("failed to set config: %w", err)
 	}
 
-	// Set up watch on this node if it doesn't exist yet
-	c.watchZkNode(path)
+	if len(watch) > 0 && watch[0] {
+		// Set up watch on this node if it doesn't exist yet
+		_ = c.watchZkNode(path)
+	}
 
 	return nil
 }
@@ -271,7 +279,7 @@ func (c *configServiceImpl) createParentNodes(configPath string) error {
 		}
 
 		if !exists {
-			_, err = c.zkConn.Create(zkPath, []byte{}, 0, zk.WorldACL(zk.PermAll))
+			_, err = c.zkConn.Create(zkPath, nil, 0, zk.WorldACL(zk.PermAll))
 			if err != nil && err != zk.ErrNodeExists {
 				return fmt.Errorf("failed to create parent node: %w", err)
 			}
@@ -386,7 +394,7 @@ func (c *configServiceImpl) GetEffective(ctx context.Context, path string, env s
 	pathsToTry := []string{
 		fmt.Sprintf("%s::%s::%s", namespace, env, path),
 		fmt.Sprintf("%s::%s", env, path),
-		fmt.Sprintf("%s::%s", "global", path),
+		path,
 	}
 
 	var lastErr error
@@ -402,9 +410,9 @@ func (c *configServiceImpl) GetEffective(ctx context.Context, path string, env s
 }
 
 // SetBatch sets multiple configs in a batch operation
-func (c *configServiceImpl) SetBatch(ctx context.Context, configs map[string]any) error {
+func (c *configServiceImpl) SetBatch(ctx context.Context, configs map[string]any, watch ...bool) error {
 	for path, value := range configs {
-		err := c.Set(ctx, path, value)
+		err := c.Set(ctx, path, value, watch...)
 		if err != nil {
 			return fmt.Errorf("failed to set config at %s: %w", path, err)
 		}
@@ -413,12 +421,12 @@ func (c *configServiceImpl) SetBatch(ctx context.Context, configs map[string]any
 }
 
 // GetBatch gets multiple configs in a batch operation
-func (c *configServiceImpl) GetBatch(ctx context.Context, paths []string) (map[string]ConfigValue, error) {
+func (c *configServiceImpl) GetBatch(ctx context.Context, paths []string, watch ...bool) (map[string]ConfigValue, error) {
 	result := make(map[string]ConfigValue)
 	var firstErr error
 
 	for _, path := range paths {
-		value, err := c.Get(ctx, path)
+		value, err := c.Get(ctx, path, watch...)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -479,7 +487,7 @@ func (c *configServiceImpl) exportRecursive(ctx context.Context, path string, en
 }
 
 // Import imports configs
-func (c *configServiceImpl) Import(ctx context.Context, configs map[string]ConfigValue) error {
+func (c *configServiceImpl) Import(ctx context.Context, configs map[string]ConfigValue, watch ...bool) error {
 	for path, value := range configs {
 		zkPath := c.getZkPath(path)
 
@@ -509,8 +517,10 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 			return fmt.Errorf("failed to import config at %s: %w", path, err)
 		}
 
-		// Set up watch
-		c.watchZkNode(path)
+		if len(watch) > 0 && watch[0] {
+			// Set up watch
+			_ = c.watchZkNode(path)
+		}
 	}
 
 	return nil
@@ -565,9 +575,6 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 
 	// Track the binding
 	c.structBindingsMu.Lock()
-	if c.structBindings == nil {
-		c.structBindings = make(map[*ConfigStructBinding]bool)
-	}
 	c.structBindings[binding] = true
 	c.structBindingsMu.Unlock()
 
@@ -623,47 +630,40 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, env string, na
 		return fmt.Errorf("failed to export configs: %w", err)
 	}
 
-	// Convert to a flat map that Viper can use
-	flatConfig := make(map[string]any)
-
-	// Convert the zookeeper path structure to a nested map structure
+	// Convert to a format that Viper can use
+	configMap := make(map[string]any)
 	for configPath, configValue := range configs {
 		// Remove the binding path prefix to get the relative path
 		relPath := strings.TrimPrefix(configPath, binding.Path)
 		relPath = strings.TrimPrefix(relPath, "/")
 
-		// Convert :: path notation to nested map keys
-		keys := strings.Split(relPath, "::")
-
 		// Handle empty path (root config)
 		if relPath == "" {
-			// If this is a direct value at the root path
-			flatConfig["value"] = configValue.Value
-			continue
+			configMap["value"] = configValue.Value
+		} else {
+			configMap[relPath] = configValue.Value
 		}
-
-		// Create nested path using dots for Viper
-		viperKey := strings.Join(keys, ".")
-		flatConfig[viperKey] = configValue.Value
 	}
 
 	// Use Viper to load the config into the struct
-	v := viper.New()
-	v.SetConfigType("json") // Use JSON as an intermediate format
+	v := viper.NewWithOptions(viper.KeyDelimiter("::"))
+	v.SetConfigType("json")
 
 	// Convert the map to JSON and load it into Viper
-	jsonData, err := json.Marshal(flatConfig)
+	jsonData, err := json.Marshal(configMap)
 	if err != nil {
 		return fmt.Errorf("failed to convert config to JSON: %w", err)
 	}
 
-	err = v.ReadConfig(strings.NewReader(string(jsonData)))
+	err = v.ReadConfig(bytes.NewReader(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
 
 	// Unmarshal into the struct
-	err = v.Unmarshal(binding.StructPtr)
+	err = v.Unmarshal(binding.StructPtr, func(dc *mapstructure.DecoderConfig) {
+		dc.TagName = "json"
+	})
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal config into struct: %w", err)
 	}
@@ -690,7 +690,7 @@ func (c *configServiceImpl) Close() error {
 	return nil
 }
 
-// SetFromStruct implements setting configuration values from a struct using Viper
+// SetFromStruct sets configuration values from a struct without using Viper.
 func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env string, namespace string, structPtr any) error {
 	// Validate the struct pointer
 	if structPtr == nil {
@@ -711,66 +711,43 @@ func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env 
 		return errors.New("structPtr must point to a struct")
 	}
 
-	// Initialize a new Viper instance
-	v1 := viper.New()
-	v1.SetConfigType("json")
-
 	// Convert struct to JSON
 	jsonData, err := json.Marshal(structPtr)
 	if err != nil {
 		return fmt.Errorf("failed to marshal struct to JSON: %w", err)
 	}
 
-	// Load JSON into Viper
-	err = v1.ReadConfig(bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to read config into Viper: %w", err)
+	// Unmarshal JSON into a map
+	var settings map[string]any
+	if err := json.Unmarshal(jsonData, &settings); err != nil {
+		return fmt.Errorf("failed to unmarshal JSON into map: %w", err)
 	}
 
-	// Get all settings as a flattened map
-	allSettings := v1.AllSettings()
-
-	// Convert the flattened map to ZooKeeper paths
+	// Flatten the settings map with custom delimiter "::" and base path.
 	zkConfigs := make(map[string]any)
+	flattenMap("", settings, zkConfigs, path)
 
-	// Process the settings recursively
-	err = processViperSettings(allSettings, "", path, env, namespace, zkConfigs)
-	if err != nil {
-		return fmt.Errorf("failed to process Viper settings: %w", err)
-	}
-
-	// Use SetBatch to set all configs
+	// Use SetBatch to set all configurations.
 	return c.SetBatch(ctx, zkConfigs)
 }
 
-// processViperSettings recursively processes Viper settings and converts them to ZooKeeper paths
-func processViperSettings(settings map[string]any, prefix string, basePath string, env string, namespace string, result map[string]any) error {
-	for k, v := range settings {
+// flattenMap recursively flattens the nested map with proper path prefixing
+func flattenMap(prefix string, input map[string]any, output map[string]any, basePath string) {
+	for k, v := range input {
 		key := k
 		if prefix != "" {
-			key = prefix + "." + k
+			key = prefix + "::" + k
 		}
 
-		switch value := v.(type) {
-		case map[string]any:
-			// Recursively process nested maps
-			err := processViperSettings(value, key, basePath, env, namespace, result)
-			if err != nil {
-				return err
-			}
-		default:
-			// Convert dot notation to :: notation
-			zkKey := strings.ReplaceAll(key, ".", "::")
+		fullPath := key
+		if basePath != "" && basePath != "/" {
+			fullPath = basePath + "::" + key
+		}
 
-			// Add the base path
-			if basePath != "" && basePath != "/" {
-				zkKey = basePath + "::" + zkKey
-			}
-
-			// Add to result map
-			result[zkKey] = v
+		if subMap, isMap := v.(map[string]any); isMap {
+			flattenMap(key, subMap, output, basePath)
+		} else {
+			output[fullPath] = v
 		}
 	}
-
-	return nil
 }

@@ -6,6 +6,8 @@ import (
 	"log"
 	"testing"
 	"time"
+
+	szk "github.com/Shopify/zk"
 )
 
 func TestConfig(t *testing.T) {
@@ -15,7 +17,7 @@ func TestConfig(t *testing.T) {
 func configTest() {
 	ctx := context.Background()
 
-	client := NewClient(
+	client := NewZkClient(
 		[]string{"localhost:2181"},
 		WithEnvironment("prod"),
 		WithNamespace("ecommerce"),
@@ -24,14 +26,16 @@ func configTest() {
 
 	type AppConfig struct {
 		Database struct {
-			URL      string `mapstructure:"url"`
-			PoolSize int    `mapstructure:"pool_size"`
-		} `mapstructure:"database"`
+			URL      string `json:"url"`
+			PoolSize int    `json:"pool_size"`
+			Username string `json:"username"`
+		} `json:"database"`
 	}
 
 	appConfig := &AppConfig{}
 	appConfig.Database.URL = "postgresql://localhost:5432/default"
 	appConfig.Database.PoolSize = 5
+	appConfig.Database.Username = "bikash"
 	err := client.SetConfig(ctx, appConfig)
 	if err != nil {
 		log.Fatalf("Failed to save config: %v", err)
@@ -59,5 +63,24 @@ func configTest() {
 		log.Fatalf("Failed to update config: %v", err)
 	}
 
-	time.Sleep(time.Second * 3)
+	time.Sleep(time.Second * 5)
+
+	fmt.Println("Updated configuration:")
+	fmt.Printf("  Database URL: %s\n", loadedConfig.Database.URL)
+	fmt.Printf("  Database Pool Size: %d\n", loadedConfig.Database.PoolSize)
+}
+
+func TestConfigShopifyZk(t *testing.T) {
+	c, _, err := szk.Connect([]string{"127.0.0.1:2181"}, 20*time.Second)
+	if err != nil {
+		panic(err)
+	}
+
+	ch, err := c.AddWatch("/", true)
+	if err != nil {
+		panic(err)
+	}
+	for e := range ch {
+		fmt.Printf("%+v\n", e)
+	}
 }
