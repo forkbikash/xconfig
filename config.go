@@ -36,7 +36,7 @@ type ConfigService interface {
 	Exists(ctx context.Context, path string) (bool, error)
 	List(ctx context.Context, path string) ([]string, error)
 
-	Subscribe(path string, handler ConfigChangeHandler) (string, error)
+	Subscribe(ctx context.Context, path string, handler ConfigChangeHandler) (string, error)
 	Unsubscribe(subscriptionID string) error
 
 	GetEffective(ctx context.Context, path string, env string, namespace string) (ConfigValue, error)

@@ -7,14 +7,14 @@ import (
 	"testing"
 	"time"
 
-	szk "github.com/Shopify/zk"
+	"github.com/Shopify/zk"
 )
 
-func TestConfig(t *testing.T) {
-	configTest()
+func TestSdk(t *testing.T) {
+	testSdk()
 }
 
-func configTest() {
+func testSdk() {
 	ctx := context.Background()
 
 	client := NewZkClient(
@@ -26,27 +26,28 @@ func configTest() {
 
 	type AppConfig struct {
 		Database struct {
-			URL      string `json:"url"`
-			PoolSize int    `json:"pool_size"`
-			Username string `json:"username"`
-		} `json:"database"`
+			URL      string `json:"url,omitempty"`
+			PoolSize int    `json:"pool_size,omitempty"`
+			Username string `json:"username,omitempty"`
+		} `json:"database,omitempty"`
 	}
 
 	appConfig := &AppConfig{}
 	appConfig.Database.URL = "postgresql://localhost:5432/default"
 	appConfig.Database.PoolSize = 5
-	appConfig.Database.Username = "bikash"
 	err := client.SetConfig(ctx, appConfig)
 	if err != nil {
 		log.Fatalf("Failed to save config: %v", err)
 	}
 
 	loadedConfig := &AppConfig{}
-	err = client.LoadConfigWithWatch(ctx, loadedConfig, func(updated any) {
+	loadedConfig.Database.Username = "bikash"
+	err = client.LoadConfigW(ctx, loadedConfig, func(updated any) {
 		cfg := updated.(*AppConfig)
 		fmt.Println("Configuration updated!")
 		fmt.Printf("  Database URL: %s\n", cfg.Database.URL)
 		fmt.Printf("  Database Pool Size: %d\n", cfg.Database.PoolSize)
+		fmt.Printf("  Database Username: %s\n", cfg.Database.Username)
 	})
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -55,10 +56,12 @@ func configTest() {
 	fmt.Println("Initial configuration:")
 	fmt.Printf("  Database URL: %s\n", loadedConfig.Database.URL)
 	fmt.Printf("  Database Pool Size: %d\n", loadedConfig.Database.PoolSize)
+	fmt.Printf("  Database Username: %s\n", loadedConfig.Database.Username)
 
 	fmt.Println("\nUpdating configuration...")
-	appConfig.Database.URL = "postgresql://prod-db:5432/orders"
-	err = client.SetConfig(ctx, appConfig)
+	appConfig2 := &AppConfig{}
+	appConfig2.Database.URL = "postgresql://prod-db:5432/orders"
+	err = client.SetConfig(ctx, appConfig2)
 	if err != nil {
 		log.Fatalf("Failed to update config: %v", err)
 	}
@@ -68,18 +71,40 @@ func configTest() {
 	fmt.Println("Updated configuration:")
 	fmt.Printf("  Database URL: %s\n", loadedConfig.Database.URL)
 	fmt.Printf("  Database Pool Size: %d\n", loadedConfig.Database.PoolSize)
+	fmt.Printf("  Database Pool Size: %s\n", loadedConfig.Database.Username)
 }
 
-func TestConfigShopifyZk(t *testing.T) {
-	c, _, err := szk.Connect([]string{"127.0.0.1:2181"}, 20*time.Second)
+func TestAddWatch(t *testing.T) {
+	c, _, err := zk.Connect([]string{"127.0.0.1:2181"}, 60*time.Second)
 	if err != nil {
 		panic(err)
 	}
 
-	ch, err := c.AddWatch("/", true)
+	ch, err := c.AddWatchCtx(context.Background(), "/bikash", true)
 	if err != nil {
 		panic(err)
 	}
+
+	for e := range ch {
+		// zk.Event {Type: EventNodeDataChanged (3), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
+		// zk.Event {Type: EventNodeCreated (1), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
+		// zk.Event {Type: EventNodeDeleted (2), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
+		fmt.Printf("%+v\n", e)
+	}
+}
+
+func TestGetW(t *testing.T) {
+	c, _, err := zk.Connect([]string{"127.0.0.1:2181"}, 60*time.Second)
+	if err != nil {
+		panic(err)
+	}
+
+	data, _, ch, err := c.GetW("/bikash")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("%+v\n", string(data))
+
 	for e := range ch {
 		fmt.Printf("%+v\n", e)
 	}

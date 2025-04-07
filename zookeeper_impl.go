@@ -13,10 +13,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Shopify/zk"
 	"github.com/go-viper/mapstructure/v2"
-	"github.com/go-zookeeper/zk"
 	"github.com/spf13/viper"
 )
+
+var v1 = viper.NewWithOptions(viper.KeyDelimiter("::"))
+
+func init() {
+	v1.SetConfigType("json")
+}
 
 // configServiceImpl implements the ConfigService interface
 type configServiceImpl struct {
@@ -38,7 +44,7 @@ type subscription struct {
 
 // NewConfigService creates a new configuration service
 func NewConfigService(zkServers []string, basePath string) (ConfigService, error) {
-	conn, _, err := zk.Connect(zkServers, time.Second*20)
+	conn, _, err := zk.Connect(zkServers, time.Second*60)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to ZooKeeper: %w", err)
 	}
@@ -102,6 +108,62 @@ func (c *configServiceImpl) dispatchEvent(event ConfigChangeEvent) {
 // getZkPath converts a logical path to ZooKeeper path
 func (c *configServiceImpl) getZkPath(logicalPath string) string {
 	return path.Join(c.baseZkPath, logicalPath)
+}
+
+// watchZkNodeRecurse sets up a watcher on a ZooKeeper node
+func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string) error {
+	zkPath := c.getZkPath(path)
+	log.Println("Watching ZK node", zkPath)
+
+	// Set up a watch on the node
+	go func() {
+		ch, err := c.zkConn.AddWatchCtx(ctx, zkPath, true)
+		if err != nil {
+			return
+		}
+
+		for e := range ch {
+			// zk.Event {Type: EventNodeDataChanged (3), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
+			// zk.Event {Type: EventNodeCreated (1), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
+			// zk.Event {Type: EventNodeDeleted (2), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
+			switch e.Type {
+			case zk.EventNodeCreated:
+				log.Println("ZK node created", e.Path)
+				// Node was created, notify subscribers
+				data, _, err := c.zkConn.Get(e.Path)
+				if err == nil {
+					var value ConfigValue
+					if err := json.Unmarshal(data, &value); err == nil {
+						c.notificationChan <- ConfigChangeEvent{
+							Path:       strings.TrimPrefix(e.Path, "/config"),
+							NewValue:   value,
+							ChangeType: Created,
+							Timestamp:  time.Now(),
+						}
+					}
+				}
+
+			case zk.EventNodeDataChanged:
+				log.Println("ZK node data changed", e.Path)
+				// Data changed, notify subscribers
+				newData, _, err := c.zkConn.Get(e.Path)
+				if err == nil {
+					var newValue ConfigValue
+					if err := json.Unmarshal(newData, &newValue); err == nil {
+						c.notificationChan <- ConfigChangeEvent{
+							Path: strings.TrimPrefix(e.Path, "/config"),
+							// OldValue:   oldValue,
+							NewValue:   newValue,
+							ChangeType: Updated,
+							Timestamp:  time.Now(),
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
 }
 
 // watchZkNode sets up a watcher on a ZooKeeper node
@@ -205,7 +267,7 @@ func (c *configServiceImpl) Get(ctx context.Context, path string, watch ...bool)
 	}
 
 	if len(watch) > 0 && watch[0] {
-		_ = c.watchZkNode(path)
+		_ = c.watchZkNodeRecurse(ctx, path)
 	}
 
 	return value, nil
@@ -251,7 +313,7 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any, wat
 
 	if len(watch) > 0 && watch[0] {
 		// Set up watch on this node if it doesn't exist yet
-		_ = c.watchZkNode(path)
+		_ = c.watchZkNodeRecurse(ctx, path)
 	}
 
 	return nil
@@ -348,7 +410,7 @@ func (c *configServiceImpl) List(ctx context.Context, path string) ([]string, er
 }
 
 // Subscribe adds a subscriber for config changes
-func (c *configServiceImpl) Subscribe(path string, handler ConfigChangeHandler) (string, error) {
+func (c *configServiceImpl) Subscribe(ctx context.Context, path string, handler ConfigChangeHandler) (string, error) {
 	if handler == nil {
 		return "", errors.New("handler cannot be nil")
 	}
@@ -364,7 +426,7 @@ func (c *configServiceImpl) Subscribe(path string, handler ConfigChangeHandler) 
 	c.subscriptionsMu.Unlock()
 
 	// Set up watch for this path and its children
-	err := c.watchZkNode(path)
+	err := c.watchZkNodeRecurse(ctx, path)
 	if err != nil {
 		c.subscriptionsMu.Lock()
 		delete(c.subscriptions, subscriptionID)
@@ -390,11 +452,16 @@ func (c *configServiceImpl) Unsubscribe(subscriptionID string) error {
 
 // GetEffective gets a config value considering the hierarchy
 func (c *configServiceImpl) GetEffective(ctx context.Context, path string, env string, namespace string) (ConfigValue, error) {
-	// Try in order: namespace-specific, env-specific, global
+	pathWithoutFirstSlash := strings.TrimPrefix(path, "/")
+	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, namespace+"::")
+	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, env+"::")
+	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, "global::")
+
+	// Try in order: namespace-env-specific, env-specific, global
 	pathsToTry := []string{
-		fmt.Sprintf("%s::%s::%s", namespace, env, path),
-		fmt.Sprintf("%s::%s", env, path),
-		path,
+		fmt.Sprintf("/%s::%s::%s", namespace, env, pathWithoutFirstSlash),
+		fmt.Sprintf("/%s::%s", env, pathWithoutFirstSlash),
+		fmt.Sprintf("/%s::%s", "global", pathWithoutFirstSlash),
 	}
 
 	var lastErr error
@@ -452,10 +519,12 @@ func (c *configServiceImpl) Export(ctx context.Context, rootPath string, env str
 
 // exportRecursive recursively exports configs
 func (c *configServiceImpl) exportRecursive(ctx context.Context, path string, env string, namespace string, result map[string]ConfigValue) error {
-	// Get current node value
-	value, err := c.GetEffective(ctx, path, env, namespace)
-	if err == nil {
-		result[path] = value
+	if path != "" {
+		// Get current node value
+		value, err := c.GetEffective(ctx, path, env, namespace)
+		if err == nil {
+			result[path] = value
+		}
 	}
 
 	// Get children
@@ -519,7 +588,7 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 
 		if len(watch) > 0 && watch[0] {
 			// Set up watch
-			_ = c.watchZkNode(path)
+			_ = c.watchZkNodeRecurse(ctx, path)
 		}
 	}
 
@@ -550,14 +619,14 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 	}
 
 	// Do the initial loading
-	err := c.loadStructFromZk(ctx, env, namespace, binding)
+	err := c.loadStructFromZk(ctx, binding.Path, env, namespace, binding)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load initial configuration: %w", err)
 	}
 
 	// Subscribe to changes
 	handler := func(event ConfigChangeEvent) {
-		err := c.loadStructFromZk(ctx, env, namespace, binding)
+		err := c.loadStructFromZk(ctx, event.Path, env, namespace, binding)
 		if err != nil {
 			// Log error but don't fail the subscription
 			fmt.Printf("Error updating struct: %v\n", err)
@@ -566,11 +635,10 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 		}
 	}
 
-	subscriptionID, err := c.Subscribe(path, handler)
+	subscriptionID, err := c.Subscribe(ctx, path, handler)
 	if err != nil {
 		return nil, fmt.Errorf("failed to subscribe to config changes: %w", err)
 	}
-
 	binding.subscriptionID = subscriptionID
 
 	// Track the binding
@@ -607,7 +675,7 @@ func (c *configServiceImpl) ReloadStruct(ctx context.Context, env string, namesp
 		return errors.New("binding cannot be nil")
 	}
 
-	err := c.loadStructFromZk(ctx, env, namespace, binding)
+	err := c.loadStructFromZk(ctx, binding.Path, env, namespace, binding)
 	if err != nil {
 		return fmt.Errorf("failed to reload struct: %w", err)
 	}
@@ -620,12 +688,12 @@ func (c *configServiceImpl) ReloadStruct(ctx context.Context, env string, namesp
 }
 
 // loadStructFromZk loads configuration data from ZooKeeper into a struct
-func (c *configServiceImpl) loadStructFromZk(ctx context.Context, env string, namespace string, binding *ConfigStructBinding) error {
+func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, env string, namespace string, binding *ConfigStructBinding) error {
 	binding.mu.Lock()
 	defer binding.mu.Unlock()
 
 	// Export all configs under the path
-	configs, err := c.Export(ctx, binding.Path, env, namespace)
+	configs, err := c.Export(ctx, path, env, namespace)
 	if err != nil {
 		return fmt.Errorf("failed to export configs: %w", err)
 	}
@@ -636,6 +704,9 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, env string, na
 		// Remove the binding path prefix to get the relative path
 		relPath := strings.TrimPrefix(configPath, binding.Path)
 		relPath = strings.TrimPrefix(relPath, "/")
+		relPath = strings.TrimPrefix(relPath, namespace+"::")
+		relPath = strings.TrimPrefix(relPath, env+"::")
+		relPath = strings.TrimPrefix(relPath, "global::")
 
 		// Handle empty path (root config)
 		if relPath == "" {
@@ -645,23 +716,20 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, env string, na
 		}
 	}
 
-	// Use Viper to load the config into the struct
-	v := viper.NewWithOptions(viper.KeyDelimiter("::"))
-	v.SetConfigType("json")
-
 	// Convert the map to JSON and load it into Viper
 	jsonData, err := json.Marshal(configMap)
 	if err != nil {
 		return fmt.Errorf("failed to convert config to JSON: %w", err)
 	}
 
-	err = v.ReadConfig(bytes.NewReader(jsonData))
+	// Use Viper to load the config into the struct
+	err = v1.ReadConfig(bytes.NewReader(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
 
 	// Unmarshal into the struct
-	err = v.Unmarshal(binding.StructPtr, func(dc *mapstructure.DecoderConfig) {
+	err = v1.Unmarshal(binding.StructPtr, func(dc *mapstructure.DecoderConfig) {
 		dc.TagName = "json"
 	})
 	if err != nil {
@@ -690,7 +758,7 @@ func (c *configServiceImpl) Close() error {
 	return nil
 }
 
-// SetFromStruct sets configuration values from a struct without using Viper.
+// SetFromStruct sets configuration values from a struct.
 func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env string, namespace string, structPtr any) error {
 	// Validate the struct pointer
 	if structPtr == nil {
@@ -725,14 +793,14 @@ func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env 
 
 	// Flatten the settings map with custom delimiter "::" and base path.
 	zkConfigs := make(map[string]any)
-	flattenMap("", settings, zkConfigs, path)
+	flattenMap("", settings, zkConfigs, path, env, namespace)
 
 	// Use SetBatch to set all configurations.
 	return c.SetBatch(ctx, zkConfigs)
 }
 
 // flattenMap recursively flattens the nested map with proper path prefixing
-func flattenMap(prefix string, input map[string]any, output map[string]any, basePath string) {
+func flattenMap(prefix string, input map[string]any, output map[string]any, basePath string, env string, namespace string) {
 	for k, v := range input {
 		key := k
 		if prefix != "" {
@@ -745,9 +813,9 @@ func flattenMap(prefix string, input map[string]any, output map[string]any, base
 		}
 
 		if subMap, isMap := v.(map[string]any); isMap {
-			flattenMap(key, subMap, output, basePath)
+			flattenMap(key, subMap, output, basePath, env, namespace)
 		} else {
-			output[fullPath] = v
+			output[namespace+"::"+env+"::"+fullPath] = v
 		}
 	}
 }

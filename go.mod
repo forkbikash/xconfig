@@ -5,7 +5,6 @@ go 1.23.0
 require (
 	github.com/Shopify/zk v1.0.12
 	github.com/go-viper/mapstructure/v2 v2.2.1
-	github.com/go-zookeeper/zk v1.0.4
 	github.com/spf13/viper v1.20.1
 )
 
