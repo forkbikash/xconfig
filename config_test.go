@@ -17,7 +17,7 @@ func TestSdk(t *testing.T) {
 func testSdk() {
 	ctx := context.Background()
 
-	client := NewZkClient(
+	client, _ := NewZkClient(
 		[]string{"localhost:2181"},
 		WithEnvironment("prod"),
 		WithNamespace("ecommerce"),

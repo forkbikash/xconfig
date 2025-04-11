@@ -2,7 +2,6 @@ package config
 
 import (
 	"context"
-	"fmt"
 )
 
 type Client struct {
@@ -14,10 +13,16 @@ type Client struct {
 
 type ClientOption func(*Client)
 
-func NewZkClient(zkServers []string, opts ...ClientOption) *Client {
-	configService, err := NewConfigService(zkServers, "/config")
+func NewZkClient(zkServers []string, opts ...ClientOption) (*Client, error) {
+	// Default config service options
+	serviceOpts := []Option{
+		WithBasePath("/config"),
+		WithDelimiter("::"),
+	}
+
+	configService, err := NewConfigService(zkServers, serviceOpts...)
 	if err != nil {
-		panic(err)
+		return nil, FormatError(ErrCodeConnection, err, "failed to create config service")
 	}
 
 	client := &Client{
@@ -28,7 +33,7 @@ func NewZkClient(zkServers []string, opts ...ClientOption) *Client {
 		opt(client)
 	}
 
-	return client
+	return client, nil
 }
 
 func WithEnvironment(env string) ClientOption {
@@ -46,7 +51,7 @@ func WithNamespace(namespace string) ClientOption {
 func (c *Client) LoadConfigW(ctx context.Context, configStruct any, callback func(any)) error {
 	_, err := c.configService.BindStructWithCallback(ctx, "", c.Environment, c.Namespace, configStruct, callback)
 	if err != nil {
-		return fmt.Errorf("failed to bind config struct: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to bind config struct")
 	}
 
 	return nil

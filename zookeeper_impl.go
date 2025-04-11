@@ -18,16 +18,12 @@ import (
 	"github.com/spf13/viper"
 )
 
-var v1 = viper.NewWithOptions(viper.KeyDelimiter("::"))
-
-func init() {
-	v1.SetConfigType("json")
-}
-
 // configServiceImpl implements the ConfigService interface
 type configServiceImpl struct {
 	zkConn           *zk.Conn
 	baseZkPath       string
+	delimiter        string
+	viper            *viper.Viper
 	subscriptions    map[string]subscription
 	subscriptionsMu  sync.RWMutex
 	structBindings   map[*ConfigStructBinding]bool
@@ -43,28 +39,45 @@ type subscription struct {
 }
 
 // NewConfigService creates a new configuration service
-func NewConfigService(zkServers []string, basePath string) (ConfigService, error) {
+func NewConfigService(zkServers []string, opts ...Option) (ConfigService, error) {
+	// Default options
+	options := ServiceOptions{
+		BasePath:  "/config",
+		Delimiter: "::",
+	}
+
+	// Apply user-provided options
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	// Create and configure Viper instance
+	v := viper.NewWithOptions(viper.KeyDelimiter(options.Delimiter))
+	v.SetConfigType("json")
+
 	conn, _, err := zk.Connect(zkServers, time.Second*60)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to ZooKeeper: %w", err)
+		return nil, FormatError(ErrCodeConnection, err, "failed to connect to ZooKeeper")
 	}
 
 	// Ensure base path exists
-	exists, _, err := conn.Exists(basePath)
+	exists, _, err := conn.Exists(options.BasePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to check base path: %w", err)
+		return nil, FormatError(ErrCodeInternal, err, "failed to check base path")
 	}
 
 	if !exists {
-		_, err = conn.Create(basePath, nil, 0, zk.WorldACL(zk.PermAll))
+		_, err = conn.Create(options.BasePath, nil, 0, zk.WorldACL(zk.PermAll))
 		if err != nil {
-			return nil, fmt.Errorf("failed to create base path: %w", err)
+			return nil, FormatError(ErrCodeInternal, err, "failed to create base path")
 		}
 	}
 
 	service := &configServiceImpl{
 		zkConn:           conn,
-		baseZkPath:       basePath,
+		baseZkPath:       options.BasePath,
+		delimiter:        options.Delimiter,
+		viper:            v,
 		subscriptions:    make(map[string]subscription),
 		structBindings:   make(map[*ConfigStructBinding]bool),
 		notificationChan: make(chan ConfigChangeEvent, 100),
@@ -76,6 +89,29 @@ func NewConfigService(zkServers []string, basePath string) (ConfigService, error
 	go service.notificationDispatcher()
 
 	return service, nil
+}
+
+// ServiceOptions contains configuration options for the config service
+type ServiceOptions struct {
+	BasePath  string // Base path in ZooKeeper
+	Delimiter string // Delimiter used for hierarchical keys
+}
+
+// Option is a function type for applying options to ServiceOptions
+type Option func(*ServiceOptions)
+
+// WithBasePath sets the base path in ZooKeeper
+func WithBasePath(basePath string) Option {
+	return func(opts *ServiceOptions) {
+		opts.BasePath = basePath
+	}
+}
+
+// WithDelimiter sets the delimiter for hierarchical keys
+func WithDelimiter(delimiter string) Option {
+	return func(opts *ServiceOptions) {
+		opts.Delimiter = delimiter
+	}
 }
 
 // notificationDispatcher distributes config change events to subscribers
@@ -110,138 +146,93 @@ func (c *configServiceImpl) getZkPath(logicalPath string) string {
 	return path.Join(c.baseZkPath, logicalPath)
 }
 
+// processZkEvent processes ZooKeeper events and sends appropriate notifications
+func (c *configServiceImpl) processZkEvent(e zk.Event) {
+	logicalPath := strings.TrimPrefix(e.Path, c.baseZkPath)
+
+	switch e.Type {
+	case zk.EventNodeCreated:
+		log.Println("ZK node created", e.Path)
+		c.handleNodeCreated(e.Path, logicalPath)
+
+	case zk.EventNodeDataChanged:
+		log.Println("ZK node data changed", e.Path)
+		c.handleNodeDataChanged(e.Path, logicalPath)
+
+	case zk.EventNodeDeleted:
+		log.Println("ZK node deleted", e.Path)
+		c.handleNodeDeleted(e.Path, logicalPath)
+	}
+}
+
+// handleNodeCreated processes node creation events
+func (c *configServiceImpl) handleNodeCreated(zkPath, logicalPath string) {
+	data, _, err := c.zkConn.Get(zkPath)
+	if err == nil {
+		var value ConfigValue
+		if err := json.Unmarshal(data, &value); err == nil {
+			c.notificationChan <- ConfigChangeEvent{
+				Path:       logicalPath,
+				NewValue:   value,
+				ChangeType: Created,
+				Timestamp:  time.Now(),
+			}
+		}
+	}
+}
+
+// handleNodeDataChanged processes node data change events
+func (c *configServiceImpl) handleNodeDataChanged(zkPath, logicalPath string) {
+	newData, _, err := c.zkConn.Get(zkPath)
+	if err == nil {
+		var newValue ConfigValue
+		if err := json.Unmarshal(newData, &newValue); err == nil {
+			// We could get the old value here if needed, but would require caching
+			c.notificationChan <- ConfigChangeEvent{
+				Path:       logicalPath,
+				NewValue:   newValue,
+				ChangeType: Updated,
+				Timestamp:  time.Now(),
+			}
+		}
+	}
+}
+
+// handleNodeDeleted processes node deletion events
+func (c *configServiceImpl) handleNodeDeleted(_, logicalPath string) {
+	// We can only know the node was deleted, not its previous value
+	// unless we had cached it, which would be a feature enhancement
+	c.notificationChan <- ConfigChangeEvent{
+		Path:       logicalPath,
+		ChangeType: Deleted,
+		Timestamp:  time.Now(),
+	}
+}
+
 // watchZkNodeRecurse sets up a watcher on a ZooKeeper node
 func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string) error {
 	zkPath := c.getZkPath(path)
-	log.Println("Watching ZK node", zkPath)
+	log.Println("Watching ZK node recursively", zkPath)
 
 	// Set up a watch on the node
 	go func() {
 		ch, err := c.zkConn.AddWatchCtx(ctx, zkPath, true)
 		if err != nil {
+			log.Printf("Error setting up recursive watch on %s: %v", zkPath, err)
 			return
 		}
 
-		for e := range ch {
-			// zk.Event {Type: EventNodeDataChanged (3), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
-			// zk.Event {Type: EventNodeCreated (1), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
-			// zk.Event {Type: EventNodeDeleted (2), State: 3, Path: "/config/ecommerce::prod::database::pool_size", Err: error nil, Server: ""}
-			switch e.Type {
-			case zk.EventNodeCreated:
-				log.Println("ZK node created", e.Path)
-				// Node was created, notify subscribers
-				data, _, err := c.zkConn.Get(e.Path)
-				if err == nil {
-					var value ConfigValue
-					if err := json.Unmarshal(data, &value); err == nil {
-						c.notificationChan <- ConfigChangeEvent{
-							Path:       strings.TrimPrefix(e.Path, "/config"),
-							NewValue:   value,
-							ChangeType: Created,
-							Timestamp:  time.Now(),
-						}
-					}
-				}
-
-			case zk.EventNodeDataChanged:
-				log.Println("ZK node data changed", e.Path)
-				// Data changed, notify subscribers
-				newData, _, err := c.zkConn.Get(e.Path)
-				if err == nil {
-					var newValue ConfigValue
-					if err := json.Unmarshal(newData, &newValue); err == nil {
-						c.notificationChan <- ConfigChangeEvent{
-							Path: strings.TrimPrefix(e.Path, "/config"),
-							// OldValue:   oldValue,
-							NewValue:   newValue,
-							ChangeType: Updated,
-							Timestamp:  time.Now(),
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	return nil
-}
-
-// watchZkNode sets up a watcher on a ZooKeeper node
-func (c *configServiceImpl) watchZkNode(path string) error {
-	zkPath := c.getZkPath(path)
-	log.Println("Watching ZK node", zkPath)
-
-	// Set up a watch on the node
-	go func() {
 		for {
-			exists, _, ch, err := c.zkConn.ExistsW(zkPath)
-			if err != nil {
-				// Log error and retry after a delay
-				continue
-			}
-
-			if !exists {
-				// If node doesn't exist, watch for creation
-				event := <-ch
-				if event.Type == zk.EventNodeCreated {
-					// Node was created, notify subscribers
-					data, _, err := c.zkConn.Get(zkPath)
-					if err == nil {
-						var value ConfigValue
-						if err := json.Unmarshal(data, &value); err == nil {
-							c.notificationChan <- ConfigChangeEvent{
-								Path:       path,
-								NewValue:   value,
-								ChangeType: Created,
-								Timestamp:  time.Now(),
-							}
-						}
-					}
+			select {
+			case e, ok := <-ch:
+				if !ok {
+					log.Printf("Channel closed for watch on %s", zkPath)
+					return
 				}
-				continue
-			}
-
-			// Node exists, watch for changes or deletion
-			data, _, ch, err := c.zkConn.GetW(zkPath)
-			if err != nil {
-				// Log error and retry
-				continue
-			}
-
-			var oldValue ConfigValue
-			if err := json.Unmarshal(data, &oldValue); err != nil {
-				// Log error but continue watching
-			}
-
-			event := <-ch
-			switch event.Type {
-			case zk.EventNodeDataChanged:
-				// Data changed, notify subscribers
-				newData, _, err := c.zkConn.Get(zkPath)
-				if err == nil {
-					var newValue ConfigValue
-					if err := json.Unmarshal(newData, &newValue); err == nil {
-						c.notificationChan <- ConfigChangeEvent{
-							Path:       path,
-							OldValue:   oldValue,
-							NewValue:   newValue,
-							ChangeType: Updated,
-							Timestamp:  time.Now(),
-						}
-					}
-				}
-			case zk.EventNodeDeleted:
-				// Node deleted, notify subscribers
-				c.notificationChan <- ConfigChangeEvent{
-					Path:       path,
-					OldValue:   oldValue,
-					ChangeType: Deleted,
-					Timestamp:  time.Now(),
-				}
-				// Exit this watch goroutine since node is deleted
+				c.processZkEvent(e)
+			case <-ctx.Done():
+				log.Printf("Context canceled for watch on %s", zkPath)
 				return
-
-			case zk.EventNodeChildrenChanged:
 			}
 		}
 	}()
@@ -256,14 +247,14 @@ func (c *configServiceImpl) Get(ctx context.Context, path string, watch ...bool)
 	data, _, err := c.zkConn.Get(zkPath)
 	if err != nil {
 		if err == zk.ErrNoNode {
-			return ConfigValue{}, fmt.Errorf("config not found at path: %s", path)
+			return ConfigValue{}, FormatError(ErrCodeNotFound, err, "config not found at path")
 		}
-		return ConfigValue{}, fmt.Errorf("failed to get config: %w", err)
+		return ConfigValue{}, FormatError(ErrCodeInternal, err, "failed to get config")
 	}
 
 	var value ConfigValue
 	if err := json.Unmarshal(data, &value); err != nil {
-		return ConfigValue{}, fmt.Errorf("failed to unmarshal config: %w", err)
+		return ConfigValue{}, FormatError(ErrCodeInternal, err, "failed to unmarshal config")
 	}
 
 	if len(watch) > 0 && watch[0] {
@@ -287,12 +278,12 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any, wat
 
 	data, err := json.Marshal(configValue)
 	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to marshal config")
 	}
 
 	exists, stat, err := c.zkConn.Exists(zkPath)
 	if err != nil {
-		return fmt.Errorf("failed to check config existence: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to check config existence")
 	}
 
 	if exists {
@@ -308,7 +299,7 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any, wat
 	}
 
 	if err != nil {
-		return fmt.Errorf("failed to set config: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to set config")
 	}
 
 	if len(watch) > 0 && watch[0] {
@@ -337,13 +328,13 @@ func (c *configServiceImpl) createParentNodes(configPath string) error {
 
 		exists, _, err := c.zkConn.Exists(zkPath)
 		if err != nil {
-			return fmt.Errorf("failed to check parent path: %w", err)
+			return FormatError(ErrCodeInternal, err, "failed to check parent path")
 		}
 
 		if !exists {
 			_, err = c.zkConn.Create(zkPath, nil, 0, zk.WorldACL(zk.PermAll))
 			if err != nil && err != zk.ErrNodeExists {
-				return fmt.Errorf("failed to create parent node: %w", err)
+				return FormatError(ErrCodeInternal, err, "failed to create parent node")
 			}
 		}
 	}
@@ -358,16 +349,16 @@ func (c *configServiceImpl) Delete(ctx context.Context, path string) error {
 	// Check for children
 	children, _, err := c.zkConn.Children(zkPath)
 	if err != nil && err != zk.ErrNoNode {
-		return fmt.Errorf("failed to check children: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to check children")
 	}
 
 	if len(children) > 0 {
-		return fmt.Errorf("cannot delete node with children, delete children first")
+		return FormatError(ErrCodeInvalidInput, nil, "cannot delete node with children, delete children first")
 	}
 
 	exists, stat, err := c.zkConn.Exists(zkPath)
 	if err != nil {
-		return fmt.Errorf("failed to check config existence: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to check config existence")
 	}
 
 	if !exists {
@@ -376,7 +367,7 @@ func (c *configServiceImpl) Delete(ctx context.Context, path string) error {
 
 	err = c.zkConn.Delete(zkPath, stat.Version)
 	if err != nil {
-		return fmt.Errorf("failed to delete config: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to delete config")
 	}
 
 	return nil
@@ -388,7 +379,7 @@ func (c *configServiceImpl) Exists(ctx context.Context, path string) (bool, erro
 
 	exists, _, err := c.zkConn.Exists(zkPath)
 	if err != nil {
-		return false, fmt.Errorf("failed to check config existence: %w", err)
+		return false, FormatError(ErrCodeInternal, err, "failed to check config existence")
 	}
 
 	return exists, nil
@@ -401,9 +392,9 @@ func (c *configServiceImpl) List(ctx context.Context, path string) ([]string, er
 	children, _, err := c.zkConn.Children(zkPath)
 	if err != nil {
 		if err == zk.ErrNoNode {
-			return nil, fmt.Errorf("path does not exist: %s", path)
+			return nil, FormatError(ErrCodeNotFound, err, "path does not exist")
 		}
-		return nil, fmt.Errorf("failed to list children: %w", err)
+		return nil, FormatError(ErrCodeInternal, err, "failed to list children")
 	}
 
 	return children, nil
@@ -412,7 +403,7 @@ func (c *configServiceImpl) List(ctx context.Context, path string) ([]string, er
 // Subscribe adds a subscriber for config changes
 func (c *configServiceImpl) Subscribe(ctx context.Context, path string, handler ConfigChangeHandler) (string, error) {
 	if handler == nil {
-		return "", errors.New("handler cannot be nil")
+		return "", FormatError(ErrCodeInvalidInput, errors.New("handler cannot be nil"), "")
 	}
 
 	// Generate subscription ID
@@ -431,7 +422,7 @@ func (c *configServiceImpl) Subscribe(ctx context.Context, path string, handler 
 		c.subscriptionsMu.Lock()
 		delete(c.subscriptions, subscriptionID)
 		c.subscriptionsMu.Unlock()
-		return "", fmt.Errorf("failed to set up watch: %w", err)
+		return "", FormatError(ErrCodeInternal, err, "failed to set up watch")
 	}
 
 	return subscriptionID, nil
@@ -443,7 +434,7 @@ func (c *configServiceImpl) Unsubscribe(subscriptionID string) error {
 	defer c.subscriptionsMu.Unlock()
 
 	if _, exists := c.subscriptions[subscriptionID]; !exists {
-		return fmt.Errorf("subscription ID not found: %s", subscriptionID)
+		return FormatError(ErrCodeNotFound, nil, "subscription ID not found")
 	}
 
 	delete(c.subscriptions, subscriptionID)
@@ -473,7 +464,7 @@ func (c *configServiceImpl) GetEffective(ctx context.Context, path string, env s
 		lastErr = err
 	}
 
-	return ConfigValue{}, fmt.Errorf("config not found in hierarchy: %w", lastErr)
+	return ConfigValue{}, FormatError(ErrCodeNotFound, lastErr, "config not found in hierarchy")
 }
 
 // SetBatch sets multiple configs in a batch operation
@@ -481,7 +472,7 @@ func (c *configServiceImpl) SetBatch(ctx context.Context, configs map[string]any
 	for path, value := range configs {
 		err := c.Set(ctx, path, value, watch...)
 		if err != nil {
-			return fmt.Errorf("failed to set config at %s: %w", path, err)
+			return FormatError(ErrCodeInternal, err, "failed to set config at "+path)
 		}
 	}
 	return nil
@@ -562,12 +553,12 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 
 		data, err := json.Marshal(value)
 		if err != nil {
-			return fmt.Errorf("failed to marshal config: %w", err)
+			return FormatError(ErrCodeInternal, err, "failed to marshal config")
 		}
 
 		exists, stat, err := c.zkConn.Exists(zkPath)
 		if err != nil {
-			return fmt.Errorf("failed to check config existence: %w", err)
+			return FormatError(ErrCodeInternal, err, "failed to check config existence")
 		}
 
 		// Create parent nodes
@@ -583,7 +574,7 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 		}
 
 		if err != nil {
-			return fmt.Errorf("failed to import config at %s: %w", path, err)
+			return FormatError(ErrCodeInternal, err, "failed to import config at "+path)
 		}
 
 		if len(watch) > 0 && watch[0] {
@@ -604,12 +595,12 @@ func (c *configServiceImpl) BindStruct(ctx context.Context, path string, env str
 func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path string, env string, namespace string, structPtr any, callback func(any)) (*ConfigStructBinding, error) {
 	// Validate the struct pointer
 	if structPtr == nil {
-		return nil, errors.New("structPtr cannot be nil")
+		return nil, FormatError(ErrCodeInvalidInput, errors.New("structPtr cannot be nil"), "")
 	}
 
 	v := reflect.ValueOf(structPtr)
 	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
-		return nil, errors.New("structPtr must be a pointer to a struct")
+		return nil, FormatError(ErrCodeInvalidInput, errors.New("structPtr must be a pointer to a struct"), "")
 	}
 
 	binding := &ConfigStructBinding{
@@ -621,7 +612,7 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 	// Do the initial loading
 	err := c.loadStructFromZk(ctx, binding.Path, env, namespace, binding)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load initial configuration: %w", err)
+		return nil, FormatError(ErrCodeInternal, err, "failed to load initial configuration")
 	}
 
 	// Subscribe to changes
@@ -637,7 +628,7 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 
 	subscriptionID, err := c.Subscribe(ctx, path, handler)
 	if err != nil {
-		return nil, fmt.Errorf("failed to subscribe to config changes: %w", err)
+		return nil, FormatError(ErrCodeInternal, err, "failed to subscribe to config changes")
 	}
 	binding.subscriptionID = subscriptionID
 
@@ -652,13 +643,13 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 // UnbindStruct removes a struct binding
 func (c *configServiceImpl) UnbindStruct(binding *ConfigStructBinding) error {
 	if binding == nil {
-		return errors.New("binding cannot be nil")
+		return FormatError(ErrCodeInvalidInput, errors.New("binding cannot be nil"), "")
 	}
 
 	if binding.subscriptionID != "" {
 		err := c.Unsubscribe(binding.subscriptionID)
 		if err != nil {
-			return fmt.Errorf("failed to unsubscribe: %w", err)
+			return FormatError(ErrCodeInternal, err, "failed to unsubscribe")
 		}
 	}
 
@@ -672,12 +663,12 @@ func (c *configServiceImpl) UnbindStruct(binding *ConfigStructBinding) error {
 // ReloadStruct manually reloads a struct from the current configuration
 func (c *configServiceImpl) ReloadStruct(ctx context.Context, env string, namespace string, binding *ConfigStructBinding) error {
 	if binding == nil {
-		return errors.New("binding cannot be nil")
+		return FormatError(ErrCodeInvalidInput, errors.New("binding cannot be nil"), "")
 	}
 
 	err := c.loadStructFromZk(ctx, binding.Path, env, namespace, binding)
 	if err != nil {
-		return fmt.Errorf("failed to reload struct: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to reload struct")
 	}
 
 	if binding.UpdateCallback != nil {
@@ -695,7 +686,7 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, e
 	// Export all configs under the path
 	configs, err := c.Export(ctx, path, env, namespace)
 	if err != nil {
-		return fmt.Errorf("failed to export configs: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to export configs")
 	}
 
 	// Convert to a format that Viper can use
@@ -704,9 +695,9 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, e
 		// Remove the binding path prefix to get the relative path
 		relPath := strings.TrimPrefix(configPath, binding.Path)
 		relPath = strings.TrimPrefix(relPath, "/")
-		relPath = strings.TrimPrefix(relPath, namespace+"::")
-		relPath = strings.TrimPrefix(relPath, env+"::")
-		relPath = strings.TrimPrefix(relPath, "global::")
+		relPath = strings.TrimPrefix(relPath, namespace+c.delimiter)
+		relPath = strings.TrimPrefix(relPath, env+c.delimiter)
+		relPath = strings.TrimPrefix(relPath, "global"+c.delimiter)
 
 		// Handle empty path (root config)
 		if relPath == "" {
@@ -719,21 +710,21 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, e
 	// Convert the map to JSON and load it into Viper
 	jsonData, err := json.Marshal(configMap)
 	if err != nil {
-		return fmt.Errorf("failed to convert config to JSON: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to convert config to JSON")
 	}
 
-	// Use Viper to load the config into the struct
-	err = v1.ReadConfig(bytes.NewReader(jsonData))
+	// Use the instance Viper to load the config into the struct
+	err = c.viper.ReadConfig(bytes.NewReader(jsonData))
 	if err != nil {
-		return fmt.Errorf("failed to read config: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to read config")
 	}
 
 	// Unmarshal into the struct
-	err = v1.Unmarshal(binding.StructPtr, func(dc *mapstructure.DecoderConfig) {
+	err = c.viper.Unmarshal(binding.StructPtr, func(dc *mapstructure.DecoderConfig) {
 		dc.TagName = "json"
 	})
 	if err != nil {
-		return fmt.Errorf("failed to unmarshal config into struct: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to unmarshal config into struct")
 	}
 
 	return nil
@@ -762,12 +753,12 @@ func (c *configServiceImpl) Close() error {
 func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env string, namespace string, structPtr any) error {
 	// Validate the struct pointer
 	if structPtr == nil {
-		return errors.New("structPtr cannot be nil")
+		return FormatError(ErrCodeInvalidInput, errors.New("structPtr cannot be nil"), "")
 	}
 
 	v := reflect.ValueOf(structPtr)
 	if v.Kind() != reflect.Ptr {
-		return errors.New("structPtr must be a pointer")
+		return FormatError(ErrCodeInvalidInput, errors.New("structPtr must be a pointer"), "")
 	}
 
 	// Dereference pointer if it's a pointer to a pointer
@@ -776,46 +767,46 @@ func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env 
 	}
 
 	if v.Elem().Kind() != reflect.Struct {
-		return errors.New("structPtr must point to a struct")
+		return FormatError(ErrCodeInvalidInput, errors.New("structPtr must point to a struct"), "")
 	}
 
 	// Convert struct to JSON
 	jsonData, err := json.Marshal(structPtr)
 	if err != nil {
-		return fmt.Errorf("failed to marshal struct to JSON: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to marshal struct to JSON")
 	}
 
 	// Unmarshal JSON into a map
 	var settings map[string]any
 	if err := json.Unmarshal(jsonData, &settings); err != nil {
-		return fmt.Errorf("failed to unmarshal JSON into map: %w", err)
+		return FormatError(ErrCodeInternal, err, "failed to unmarshal JSON into map")
 	}
 
 	// Flatten the settings map with custom delimiter "::" and base path.
 	zkConfigs := make(map[string]any)
-	flattenMap("", settings, zkConfigs, path, env, namespace)
+	c.flattenMap("", settings, zkConfigs, path, env, namespace)
 
 	// Use SetBatch to set all configurations.
 	return c.SetBatch(ctx, zkConfigs)
 }
 
 // flattenMap recursively flattens the nested map with proper path prefixing
-func flattenMap(prefix string, input map[string]any, output map[string]any, basePath string, env string, namespace string) {
+func (c *configServiceImpl) flattenMap(prefix string, input map[string]any, output map[string]any, basePath string, env string, namespace string) {
 	for k, v := range input {
 		key := k
 		if prefix != "" {
-			key = prefix + "::" + k
+			key = prefix + c.delimiter + k
 		}
 
 		fullPath := key
 		if basePath != "" && basePath != "/" {
-			fullPath = basePath + "::" + key
+			fullPath = basePath + c.delimiter + key
 		}
 
 		if subMap, isMap := v.(map[string]any); isMap {
-			flattenMap(key, subMap, output, basePath, env, namespace)
+			c.flattenMap(key, subMap, output, basePath, env, namespace)
 		} else {
-			output[namespace+"::"+env+"::"+fullPath] = v
+			output[namespace+c.delimiter+env+c.delimiter+fullPath] = v
 		}
 	}
 }
