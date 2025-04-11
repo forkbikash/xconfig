@@ -21,9 +21,11 @@ import (
 // configServiceImpl implements the ConfigService interface
 type configServiceImpl struct {
 	zkConn           *zk.Conn
+	zkConnMu         sync.RWMutex // Mutex for ZooKeeper connection operations
 	baseZkPath       string
 	delimiter        string
 	viper            *viper.Viper
+	viperMu          sync.RWMutex // Mutex for Viper operations
 	subscriptions    map[string]subscription
 	subscriptionsMu  sync.RWMutex
 	structBindings   map[*ConfigStructBinding]bool
@@ -71,12 +73,14 @@ func NewConfigService(zkServers []string, opts ...Option) (ConfigService, error)
 	// Ensure base path exists
 	exists, _, err := conn.Exists(options.BasePath)
 	if err != nil {
+		conn.Close() // Clean up connection on error
 		return nil, FormatError(ErrCodeInternal, err, "failed to check base path")
 	}
 
 	if !exists {
 		_, err = conn.Create(options.BasePath, nil, 0, zk.WorldACL(zk.PermAll))
 		if err != nil {
+			conn.Close() // Clean up connection on error
 			return nil, FormatError(ErrCodeInternal, err, "failed to create base path")
 		}
 	}
@@ -155,7 +159,11 @@ func (c *configServiceImpl) notificationDispatcher() {
 			return
 		case <-c.rootCtx.Done():
 			return
-		case event := <-c.notificationChan:
+		case event, ok := <-c.notificationChan:
+			if !ok {
+				// Channel closed
+				return
+			}
 			c.dispatchEvent(event)
 		}
 	}
@@ -207,13 +215,18 @@ func (c *configServiceImpl) processZkEvent(ctx context.Context, e zk.Event) {
 
 // handleNodeCreated processes node creation events
 func (c *configServiceImpl) handleNodeCreated(ctx context.Context, zkPath, logicalPath string) {
+	c.zkConnMu.RLock()
 	data, _, err := c.zkConn.Get(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err == nil {
 		var value ConfigValue
 		if err := json.Unmarshal(data, &value); err == nil {
 			// Ensure service is still active before sending notification
 			select {
 			case <-ctx.Done():
+				return
+			case <-c.rootCtx.Done():
 				return
 			case c.notificationChan <- ConfigChangeEvent{
 				Path:       logicalPath,
@@ -229,13 +242,18 @@ func (c *configServiceImpl) handleNodeCreated(ctx context.Context, zkPath, logic
 
 // handleNodeDataChanged processes node data change events
 func (c *configServiceImpl) handleNodeDataChanged(ctx context.Context, zkPath, logicalPath string) {
+	c.zkConnMu.RLock()
 	newData, _, err := c.zkConn.Get(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err == nil {
 		var newValue ConfigValue
 		if err := json.Unmarshal(newData, &newValue); err == nil {
 			// We could get the old value here if needed, but would require caching
 			select {
 			case <-ctx.Done():
+				return
+			case <-c.rootCtx.Done():
 				return
 			case c.notificationChan <- ConfigChangeEvent{
 				Path:       logicalPath,
@@ -256,6 +274,8 @@ func (c *configServiceImpl) handleNodeDeleted(ctx context.Context, _, logicalPat
 	select {
 	case <-ctx.Done():
 		return
+	case <-c.rootCtx.Done():
+		return
 	case c.notificationChan <- ConfigChangeEvent{
 		Path:       logicalPath,
 		ChangeType: Deleted,
@@ -272,7 +292,10 @@ func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string)
 
 	// Set up a watch on the node
 	go func() {
+		c.zkConnMu.RLock()
 		ch, err := c.zkConn.AddWatchCtx(ctx, zkPath, true)
+		c.zkConnMu.RUnlock()
+
 		if err != nil {
 			log.Printf("Error setting up recursive watch on %s: %v", zkPath, err)
 			return
@@ -286,6 +309,8 @@ func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string)
 					return
 				}
 				c.processZkEvent(ctx, e)
+			case <-c.rootCtx.Done():
+				return
 			case <-ctx.Done():
 				log.Printf("Context canceled for watch on %s", zkPath)
 				return
@@ -300,7 +325,10 @@ func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string)
 func (c *configServiceImpl) Get(ctx context.Context, path string, watch ...bool) (ConfigValue, error) {
 	zkPath := c.getZkPath(path)
 
+	c.zkConnMu.RLock()
 	data, _, err := c.zkConn.Get(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err != nil {
 		if err == zk.ErrNoNode {
 			return ConfigValue{}, FormatError(ErrCodeNotFound, err, "config not found at path")
@@ -337,13 +365,18 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any, wat
 		return FormatError(ErrCodeInternal, err, "failed to marshal config")
 	}
 
+	c.zkConnMu.RLock()
 	exists, stat, err := c.zkConn.Exists(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err != nil {
 		return FormatError(ErrCodeInternal, err, "failed to check config existence")
 	}
 
 	if exists {
+		c.zkConnMu.Lock()
 		_, err = c.zkConn.Set(zkPath, data, stat.Version)
+		c.zkConnMu.Unlock()
 	} else {
 		// Create parent nodes if they don't exist
 		err = c.createParentNodes(ctx, path)
@@ -351,7 +384,9 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any, wat
 			return err
 		}
 
+		c.zkConnMu.Lock()
 		_, err = c.zkConn.Create(zkPath, data, 0, zk.WorldACL(zk.PermAll))
+		c.zkConnMu.Unlock()
 	}
 
 	if err != nil {
@@ -382,13 +417,19 @@ func (c *configServiceImpl) createParentNodes(ctx context.Context, configPath st
 		current = path.Join(current, parts[i])
 		zkPath := c.getZkPath(current)
 
+		c.zkConnMu.RLock()
 		exists, _, err := c.zkConn.Exists(zkPath)
+		c.zkConnMu.RUnlock()
+
 		if err != nil {
 			return FormatError(ErrCodeInternal, err, "failed to check parent path")
 		}
 
 		if !exists {
+			c.zkConnMu.Lock()
 			_, err = c.zkConn.Create(zkPath, nil, 0, zk.WorldACL(zk.PermAll))
+			c.zkConnMu.Unlock()
+
 			if err != nil && err != zk.ErrNodeExists {
 				return FormatError(ErrCodeInternal, err, "failed to create parent node")
 			}
@@ -403,7 +444,10 @@ func (c *configServiceImpl) Delete(ctx context.Context, path string) error {
 	zkPath := c.getZkPath(path)
 
 	// Check for children
+	c.zkConnMu.RLock()
 	children, _, err := c.zkConn.Children(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err != nil && err != zk.ErrNoNode {
 		return FormatError(ErrCodeInternal, err, "failed to check children")
 	}
@@ -412,7 +456,10 @@ func (c *configServiceImpl) Delete(ctx context.Context, path string) error {
 		return FormatError(ErrCodeInvalidInput, nil, "cannot delete node with children, delete children first")
 	}
 
+	c.zkConnMu.RLock()
 	exists, stat, err := c.zkConn.Exists(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err != nil {
 		return FormatError(ErrCodeInternal, err, "failed to check config existence")
 	}
@@ -421,7 +468,10 @@ func (c *configServiceImpl) Delete(ctx context.Context, path string) error {
 		return nil // Already deleted
 	}
 
+	c.zkConnMu.Lock()
 	err = c.zkConn.Delete(zkPath, stat.Version)
+	c.zkConnMu.Unlock()
+
 	if err != nil {
 		return FormatError(ErrCodeInternal, err, "failed to delete config")
 	}
@@ -433,7 +483,10 @@ func (c *configServiceImpl) Delete(ctx context.Context, path string) error {
 func (c *configServiceImpl) Exists(ctx context.Context, path string) (bool, error) {
 	zkPath := c.getZkPath(path)
 
+	c.zkConnMu.RLock()
 	exists, _, err := c.zkConn.Exists(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err != nil {
 		return false, FormatError(ErrCodeInternal, err, "failed to check config existence")
 	}
@@ -445,7 +498,10 @@ func (c *configServiceImpl) Exists(ctx context.Context, path string) (bool, erro
 func (c *configServiceImpl) List(ctx context.Context, path string) ([]string, error) {
 	zkPath := c.getZkPath(path)
 
+	c.zkConnMu.RLock()
 	children, _, err := c.zkConn.Children(zkPath)
+	c.zkConnMu.RUnlock()
+
 	if err != nil {
 		if err == zk.ErrNoNode {
 			return nil, FormatError(ErrCodeNotFound, err, "path does not exist")
@@ -642,7 +698,10 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 			return FormatError(ErrCodeInternal, err, "failed to marshal config")
 		}
 
+		c.zkConnMu.RLock()
 		exists, stat, err := c.zkConn.Exists(zkPath)
+		c.zkConnMu.RUnlock()
+
 		if err != nil {
 			return FormatError(ErrCodeInternal, err, "failed to check config existence")
 		}
@@ -654,9 +713,13 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 		}
 
 		if exists {
+			c.zkConnMu.Lock()
 			_, err = c.zkConn.Set(zkPath, data, stat.Version)
+			c.zkConnMu.Unlock()
 		} else {
+			c.zkConnMu.Lock()
 			_, err = c.zkConn.Create(zkPath, data, 0, zk.WorldACL(zk.PermAll))
+			c.zkConnMu.Unlock()
 		}
 
 		if err != nil {
@@ -802,8 +865,11 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, b
 	}
 
 	// Use the instance Viper to load the config into the struct
+	// Lock viper during operations
+	c.viperMu.Lock()
 	err = c.viper.ReadConfig(bytes.NewReader(jsonData))
 	if err != nil {
+		c.viperMu.Unlock()
 		return FormatError(ErrCodeInternal, err, "failed to read config")
 	}
 
@@ -811,6 +877,8 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, b
 	err = c.viper.Unmarshal(binding.StructPtr, func(dc *mapstructure.DecoderConfig) {
 		dc.TagName = "json"
 	})
+	c.viperMu.Unlock()
+
 	if err != nil {
 		return FormatError(ErrCodeInternal, err, "failed to unmarshal config into struct")
 	}
