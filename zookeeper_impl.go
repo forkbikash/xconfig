@@ -33,11 +33,17 @@ type configServiceImpl struct {
 	wg               sync.WaitGroup
 	Environment      string
 	Namespace        string
+
+	// Add a root context for the service
+	rootCtx       context.Context
+	rootCtxCancel context.CancelFunc
 }
 
 type subscription struct {
 	path    string
 	handler ConfigChangeHandler
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 // NewConfigService creates a new configuration service
@@ -75,6 +81,9 @@ func NewConfigService(zkServers []string, opts ...Option) (ConfigService, error)
 		}
 	}
 
+	// Create a root context for the service lifecycle
+	rootCtx, rootCtxCancel := context.WithCancel(context.Background())
+
 	service := &configServiceImpl{
 		zkConn:           conn,
 		baseZkPath:       options.BasePath,
@@ -84,6 +93,10 @@ func NewConfigService(zkServers []string, opts ...Option) (ConfigService, error)
 		structBindings:   make(map[*ConfigStructBinding]bool),
 		notificationChan: make(chan ConfigChangeEvent, 100),
 		closeChan:        make(chan struct{}),
+		Environment:      options.Environment,
+		Namespace:        options.Namespace,
+		rootCtx:          rootCtx,
+		rootCtxCancel:    rootCtxCancel,
 	}
 
 	// Start the notification dispatcher
@@ -140,6 +153,8 @@ func (c *configServiceImpl) notificationDispatcher() {
 		select {
 		case <-c.closeChan:
 			return
+		case <-c.rootCtx.Done():
+			return
 		case event := <-c.notificationChan:
 			c.dispatchEvent(event)
 		}
@@ -154,7 +169,14 @@ func (c *configServiceImpl) dispatchEvent(event ConfigChangeEvent) {
 	for _, sub := range c.subscriptions {
 		// Check if subscription path is a prefix of or equal to the event path
 		if strings.HasPrefix(event.Path, sub.path) {
-			sub.handler(event)
+			// Check if this subscription's context is still valid
+			select {
+			case <-sub.ctx.Done():
+				// Skip this subscriber as its context is cancelled
+				continue
+			default:
+				sub.handler(event)
+			}
 		}
 	}
 }
@@ -165,65 +187,81 @@ func (c *configServiceImpl) getZkPath(logicalPath string) string {
 }
 
 // processZkEvent processes ZooKeeper events and sends appropriate notifications
-func (c *configServiceImpl) processZkEvent(e zk.Event) {
+func (c *configServiceImpl) processZkEvent(ctx context.Context, e zk.Event) {
 	logicalPath := strings.TrimPrefix(e.Path, c.baseZkPath)
 
 	switch e.Type {
 	case zk.EventNodeCreated:
 		log.Println("ZK node created", e.Path)
-		c.handleNodeCreated(e.Path, logicalPath)
+		c.handleNodeCreated(ctx, e.Path, logicalPath)
 
 	case zk.EventNodeDataChanged:
 		log.Println("ZK node data changed", e.Path)
-		c.handleNodeDataChanged(e.Path, logicalPath)
+		c.handleNodeDataChanged(ctx, e.Path, logicalPath)
 
 	case zk.EventNodeDeleted:
 		log.Println("ZK node deleted", e.Path)
-		c.handleNodeDeleted(e.Path, logicalPath)
+		c.handleNodeDeleted(ctx, e.Path, logicalPath)
 	}
 }
 
 // handleNodeCreated processes node creation events
-func (c *configServiceImpl) handleNodeCreated(zkPath, logicalPath string) {
+func (c *configServiceImpl) handleNodeCreated(ctx context.Context, zkPath, logicalPath string) {
 	data, _, err := c.zkConn.Get(zkPath)
 	if err == nil {
 		var value ConfigValue
 		if err := json.Unmarshal(data, &value); err == nil {
-			c.notificationChan <- ConfigChangeEvent{
+			// Ensure service is still active before sending notification
+			select {
+			case <-ctx.Done():
+				return
+			case c.notificationChan <- ConfigChangeEvent{
 				Path:       logicalPath,
 				NewValue:   value,
 				ChangeType: Created,
 				Timestamp:  time.Now(),
+			}:
+				// Notification sent successfully
 			}
 		}
 	}
 }
 
 // handleNodeDataChanged processes node data change events
-func (c *configServiceImpl) handleNodeDataChanged(zkPath, logicalPath string) {
+func (c *configServiceImpl) handleNodeDataChanged(ctx context.Context, zkPath, logicalPath string) {
 	newData, _, err := c.zkConn.Get(zkPath)
 	if err == nil {
 		var newValue ConfigValue
 		if err := json.Unmarshal(newData, &newValue); err == nil {
 			// We could get the old value here if needed, but would require caching
-			c.notificationChan <- ConfigChangeEvent{
+			select {
+			case <-ctx.Done():
+				return
+			case c.notificationChan <- ConfigChangeEvent{
 				Path:       logicalPath,
 				NewValue:   newValue,
 				ChangeType: Updated,
 				Timestamp:  time.Now(),
+			}:
+				// Notification sent successfully
 			}
 		}
 	}
 }
 
 // handleNodeDeleted processes node deletion events
-func (c *configServiceImpl) handleNodeDeleted(_, logicalPath string) {
+func (c *configServiceImpl) handleNodeDeleted(ctx context.Context, _, logicalPath string) {
 	// We can only know the node was deleted, not its previous value
 	// unless we had cached it, which would be a feature enhancement
-	c.notificationChan <- ConfigChangeEvent{
+	select {
+	case <-ctx.Done():
+		return
+	case c.notificationChan <- ConfigChangeEvent{
 		Path:       logicalPath,
 		ChangeType: Deleted,
 		Timestamp:  time.Now(),
+	}:
+		// Notification sent successfully
 	}
 }
 
@@ -247,7 +285,7 @@ func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string)
 					log.Printf("Channel closed for watch on %s", zkPath)
 					return
 				}
-				c.processZkEvent(e)
+				c.processZkEvent(ctx, e)
 			case <-ctx.Done():
 				log.Printf("Context canceled for watch on %s", zkPath)
 				return
@@ -308,7 +346,7 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any, wat
 		_, err = c.zkConn.Set(zkPath, data, stat.Version)
 	} else {
 		// Create parent nodes if they don't exist
-		err = c.createParentNodes(path)
+		err = c.createParentNodes(ctx, path)
 		if err != nil {
 			return err
 		}
@@ -329,7 +367,7 @@ func (c *configServiceImpl) Set(ctx context.Context, path string, value any, wat
 }
 
 // createParentNodes ensures all parent nodes in a path exist
-func (c *configServiceImpl) createParentNodes(configPath string) error {
+func (c *configServiceImpl) createParentNodes(ctx context.Context, configPath string) error {
 	parts := strings.Split(configPath, "/")
 	if len(parts) <= 1 {
 		return nil // No parent needed
@@ -427,19 +465,37 @@ func (c *configServiceImpl) Subscribe(ctx context.Context, path string, handler 
 	// Generate subscription ID
 	subscriptionID := fmt.Sprintf("sub_%d", time.Now().UnixNano())
 
+	// Create a dedicated context for this subscription
+	subCtx, subCancel := context.WithCancel(context.Background())
+
+	// Track cancellation of either the subscription context or the service context
+	go func() {
+		select {
+		case <-ctx.Done():
+			subCancel()
+		case <-c.rootCtx.Done():
+			subCancel()
+		case <-subCtx.Done():
+			// Already cancelled
+		}
+	}()
+
 	c.subscriptionsMu.Lock()
 	c.subscriptions[subscriptionID] = subscription{
 		path:    path,
 		handler: handler,
+		ctx:     subCtx,
+		cancel:  subCancel,
 	}
 	c.subscriptionsMu.Unlock()
 
 	// Set up watch for this path and its children
-	err := c.watchZkNodeRecurse(ctx, path)
+	err := c.watchZkNodeRecurse(subCtx, path)
 	if err != nil {
 		c.subscriptionsMu.Lock()
 		delete(c.subscriptions, subscriptionID)
 		c.subscriptionsMu.Unlock()
+		subCancel() // Clean up the context
 		return "", FormatError(ErrCodeInternal, err, "failed to set up watch")
 	}
 
@@ -451,8 +507,14 @@ func (c *configServiceImpl) Unsubscribe(subscriptionID string) error {
 	c.subscriptionsMu.Lock()
 	defer c.subscriptionsMu.Unlock()
 
-	if _, exists := c.subscriptions[subscriptionID]; !exists {
+	sub, exists := c.subscriptions[subscriptionID]
+	if !exists {
 		return FormatError(ErrCodeNotFound, nil, "subscription ID not found")
+	}
+
+	// Cancel the subscription context
+	if sub.cancel != nil {
+		sub.cancel()
 	}
 
 	delete(c.subscriptions, subscriptionID)
@@ -557,7 +619,13 @@ func (c *configServiceImpl) exportRecursive(ctx context.Context, path string, re
 
 		err := c.exportRecursive(ctx, childPath, result)
 		if err != nil {
-			return err
+			// Check if it's a context error
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			// Otherwise continue with other children
+			log.Printf("Error exporting child path %s: %v", childPath, err)
+			continue
 		}
 	}
 
@@ -580,7 +648,7 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 		}
 
 		// Create parent nodes
-		err = c.createParentNodes(path)
+		err = c.createParentNodes(ctx, path)
 		if err != nil {
 			return err
 		}
@@ -628,14 +696,21 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 		return nil, FormatError(ErrCodeInternal, err, "failed to load initial configuration")
 	}
 
-	// Subscribe to changes
+	// Create a handler function that respects the context
 	handler := func(event ConfigChangeEvent) {
-		err := c.loadStructFromZk(ctx, event.Path, binding)
-		if err != nil {
-			// Log error but don't fail the subscription
-			fmt.Printf("Error updating struct: %v\n", err)
-		} else if binding.UpdateCallback != nil {
-			binding.UpdateCallback(binding.StructPtr)
+		// Check if context is still valid before handling the update
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			// Process the update
+			err := c.loadStructFromZk(ctx, event.Path, binding)
+			if err != nil {
+				// Log error but don't fail the subscription
+				log.Printf("Error updating struct: %v\n", err)
+			} else if binding.UpdateCallback != nil {
+				binding.UpdateCallback(binding.StructPtr)
+			}
 		}
 	}
 
@@ -745,6 +820,11 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, b
 
 // Close also cleans up struct bindings
 func (c *configServiceImpl) Close() error {
+	// Signal all goroutines to shut down
+	if c.rootCtxCancel != nil {
+		c.rootCtxCancel()
+	}
+
 	// Clean up all struct bindings
 	c.structBindingsMu.Lock()
 	for binding := range c.structBindings {
@@ -754,6 +834,16 @@ func (c *configServiceImpl) Close() error {
 	}
 	c.structBindings = nil
 	c.structBindingsMu.Unlock()
+
+	// Clean up all subscriptions
+	c.subscriptionsMu.Lock()
+	for id, sub := range c.subscriptions {
+		if sub.cancel != nil {
+			sub.cancel()
+		}
+		delete(c.subscriptions, id)
+	}
+	c.subscriptionsMu.Unlock()
 
 	// Continue with regular close
 	close(c.closeChan)
