@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"path"
 	"reflect"
 	"strings"
@@ -200,15 +199,12 @@ func (c *configServiceImpl) processZkEvent(ctx context.Context, e zk.Event) {
 
 	switch e.Type {
 	case zk.EventNodeCreated:
-		log.Println("ZK node created", e.Path)
 		c.handleNodeCreated(ctx, e.Path, logicalPath)
 
 	case zk.EventNodeDataChanged:
-		log.Println("ZK node data changed", e.Path)
 		c.handleNodeDataChanged(ctx, e.Path, logicalPath)
 
 	case zk.EventNodeDeleted:
-		log.Println("ZK node deleted", e.Path)
 		c.handleNodeDeleted(ctx, e.Path, logicalPath)
 	}
 }
@@ -288,7 +284,6 @@ func (c *configServiceImpl) handleNodeDeleted(ctx context.Context, _, logicalPat
 // watchZkNodeRecurse sets up a watcher on a ZooKeeper node
 func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string) error {
 	zkPath := c.getZkPath(path)
-	log.Println("Watching ZK node recursively", zkPath)
 
 	// Set up a watch on the node
 	go func() {
@@ -297,7 +292,6 @@ func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string)
 		c.zkConnMu.RUnlock()
 
 		if err != nil {
-			log.Printf("Error setting up recursive watch on %s: %v", zkPath, err)
 			return
 		}
 
@@ -305,14 +299,12 @@ func (c *configServiceImpl) watchZkNodeRecurse(ctx context.Context, path string)
 			select {
 			case e, ok := <-ch:
 				if !ok {
-					log.Printf("Channel closed for watch on %s", zkPath)
 					return
 				}
 				c.processZkEvent(ctx, e)
 			case <-c.rootCtx.Done():
 				return
 			case <-ctx.Done():
-				log.Printf("Context canceled for watch on %s", zkPath)
 				return
 			}
 		}
@@ -680,7 +672,6 @@ func (c *configServiceImpl) exportRecursive(ctx context.Context, path string, re
 				return err
 			}
 			// Otherwise continue with other children
-			log.Printf("Error exporting child path %s: %v", childPath, err)
 			continue
 		}
 	}
@@ -770,7 +761,6 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 			err := c.loadStructFromZk(ctx, event.Path, binding)
 			if err != nil {
 				// Log error but don't fail the subscription
-				log.Printf("Error updating struct: %v\n", err)
 			} else if binding.UpdateCallback != nil {
 				binding.UpdateCallback(binding.StructPtr)
 			}
