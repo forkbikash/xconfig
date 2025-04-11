@@ -39,20 +39,19 @@ type ConfigService interface {
 	Subscribe(ctx context.Context, path string, handler ConfigChangeHandler) (string, error)
 	Unsubscribe(subscriptionID string) error
 
-	GetEffective(ctx context.Context, path string, env string, namespace string) (ConfigValue, error)
+	GetEffective(ctx context.Context, path string) (ConfigValue, error)
 
 	SetBatch(ctx context.Context, configs map[string]any, watch ...bool) error
 	GetBatch(ctx context.Context, paths []string, watch ...bool) (map[string]ConfigValue, error)
 
-	Export(ctx context.Context, rootPath string, env string, namespace string) (map[string]ConfigValue, error)
+	Export(ctx context.Context, rootPath string) (map[string]ConfigValue, error)
 	Import(ctx context.Context, configs map[string]ConfigValue, watch ...bool) error
 
-	BindStruct(ctx context.Context, path string, env string, namespace string, structPtr any) (*ConfigStructBinding, error)
-	BindStructWithCallback(ctx context.Context, path string, env string, namespace string, structPtr any, callback func(any)) (*ConfigStructBinding, error)
+	BindStructWithCallback(ctx context.Context, path string, structPtr any, callback func(any)) (*ConfigStructBinding, error)
 	UnbindStruct(binding *ConfigStructBinding) error
-	ReloadStruct(ctx context.Context, env string, namespace string, binding *ConfigStructBinding) error
+	ReloadStruct(ctx context.Context, binding *ConfigStructBinding) error
 
-	SetFromStruct(ctx context.Context, path string, env string, namespace string, structPtr any) error
+	SetFromStruct(ctx context.Context, path string, structPtr any) error
 
 	Close() error
 }

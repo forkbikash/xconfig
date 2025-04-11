@@ -17,7 +17,7 @@ func TestSdk(t *testing.T) {
 func testSdk() {
 	ctx := context.Background()
 
-	client, _ := NewZkClient(
+	client, _ := NewConfigService(
 		[]string{"localhost:2181"},
 		WithEnvironment("prod"),
 		WithNamespace("ecommerce"),
@@ -35,14 +35,14 @@ func testSdk() {
 	appConfig := &AppConfig{}
 	appConfig.Database.URL = "postgresql://localhost:5432/default"
 	appConfig.Database.PoolSize = 5
-	err := client.SetConfig(ctx, appConfig)
+	err := client.SetFromStruct(ctx, "", appConfig)
 	if err != nil {
 		log.Fatalf("Failed to save config: %v", err)
 	}
 
 	loadedConfig := &AppConfig{}
 	loadedConfig.Database.Username = "bikash"
-	err = client.LoadConfigW(ctx, loadedConfig, func(updated any) {
+	_, err = client.BindStructWithCallback(ctx, "", loadedConfig, func(updated any) {
 		cfg := updated.(*AppConfig)
 		fmt.Println("Configuration updated!")
 		fmt.Printf("  Database URL: %s\n", cfg.Database.URL)
@@ -61,7 +61,7 @@ func testSdk() {
 	fmt.Println("\nUpdating configuration...")
 	appConfig2 := &AppConfig{}
 	appConfig2.Database.URL = "postgresql://prod-db:5432/orders"
-	err = client.SetConfig(ctx, appConfig2)
+	err = client.SetFromStruct(ctx, "", appConfig2)
 	if err != nil {
 		log.Fatalf("Failed to update config: %v", err)
 	}

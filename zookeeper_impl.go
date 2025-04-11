@@ -31,6 +31,8 @@ type configServiceImpl struct {
 	notificationChan chan ConfigChangeEvent
 	closeChan        chan struct{}
 	wg               sync.WaitGroup
+	Environment      string
+	Namespace        string
 }
 
 type subscription struct {
@@ -93,8 +95,10 @@ func NewConfigService(zkServers []string, opts ...Option) (ConfigService, error)
 
 // ServiceOptions contains configuration options for the config service
 type ServiceOptions struct {
-	BasePath  string // Base path in ZooKeeper
-	Delimiter string // Delimiter used for hierarchical keys
+	BasePath    string // Base path in ZooKeeper
+	Delimiter   string // Delimiter used for hierarchical keys
+	Environment string // Environment (e.g., "dev", "prod")
+	Namespace   string // Namespace (e.g., "ecommerce")
 }
 
 // Option is a function type for applying options to ServiceOptions
@@ -111,6 +115,20 @@ func WithBasePath(basePath string) Option {
 func WithDelimiter(delimiter string) Option {
 	return func(opts *ServiceOptions) {
 		opts.Delimiter = delimiter
+	}
+}
+
+// WithEnvironment sets the environment
+func WithEnvironment(env string) Option {
+	return func(opts *ServiceOptions) {
+		opts.Environment = env
+	}
+}
+
+// WithNamespace sets the namespace
+func WithNamespace(namespace string) Option {
+	return func(opts *ServiceOptions) {
+		opts.Namespace = namespace
 	}
 }
 
@@ -442,16 +460,16 @@ func (c *configServiceImpl) Unsubscribe(subscriptionID string) error {
 }
 
 // GetEffective gets a config value considering the hierarchy
-func (c *configServiceImpl) GetEffective(ctx context.Context, path string, env string, namespace string) (ConfigValue, error) {
+func (c *configServiceImpl) GetEffective(ctx context.Context, path string) (ConfigValue, error) {
 	pathWithoutFirstSlash := strings.TrimPrefix(path, "/")
-	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, namespace+"::")
-	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, env+"::")
+	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, c.Namespace+"::")
+	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, c.Environment+"::")
 	pathWithoutFirstSlash = strings.TrimPrefix(pathWithoutFirstSlash, "global::")
 
 	// Try in order: namespace-env-specific, env-specific, global
 	pathsToTry := []string{
-		fmt.Sprintf("/%s::%s::%s", namespace, env, pathWithoutFirstSlash),
-		fmt.Sprintf("/%s::%s", env, pathWithoutFirstSlash),
+		fmt.Sprintf("/%s::%s::%s", c.Namespace, c.Environment, pathWithoutFirstSlash),
+		fmt.Sprintf("/%s::%s", c.Environment, pathWithoutFirstSlash),
 		fmt.Sprintf("/%s::%s", "global", pathWithoutFirstSlash),
 	}
 
@@ -502,17 +520,17 @@ func (c *configServiceImpl) GetBatch(ctx context.Context, paths []string, watch 
 }
 
 // Export exports all configs under a path
-func (c *configServiceImpl) Export(ctx context.Context, rootPath string, env string, namespace string) (map[string]ConfigValue, error) {
+func (c *configServiceImpl) Export(ctx context.Context, rootPath string) (map[string]ConfigValue, error) {
 	result := make(map[string]ConfigValue)
-	err := c.exportRecursive(ctx, rootPath, env, namespace, result)
+	err := c.exportRecursive(ctx, rootPath, result)
 	return result, err
 }
 
 // exportRecursive recursively exports configs
-func (c *configServiceImpl) exportRecursive(ctx context.Context, path string, env string, namespace string, result map[string]ConfigValue) error {
+func (c *configServiceImpl) exportRecursive(ctx context.Context, path string, result map[string]ConfigValue) error {
 	if path != "" {
 		// Get current node value
-		value, err := c.GetEffective(ctx, path, env, namespace)
+		value, err := c.GetEffective(ctx, path)
 		if err == nil {
 			result[path] = value
 		}
@@ -537,7 +555,7 @@ func (c *configServiceImpl) exportRecursive(ctx context.Context, path string, en
 			childPath = path + "/" + child
 		}
 
-		err := c.exportRecursive(ctx, childPath, env, namespace, result)
+		err := c.exportRecursive(ctx, childPath, result)
 		if err != nil {
 			return err
 		}
@@ -586,13 +604,8 @@ func (c *configServiceImpl) Import(ctx context.Context, configs map[string]Confi
 	return nil
 }
 
-// BindStruct binds a struct to a configuration path with real-time updates
-func (c *configServiceImpl) BindStruct(ctx context.Context, path string, env string, namespace string, structPtr any) (*ConfigStructBinding, error) {
-	return c.BindStructWithCallback(ctx, path, env, namespace, structPtr, nil)
-}
-
 // BindStructWithCallback binds a struct to a configuration path with a callback for updates
-func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path string, env string, namespace string, structPtr any, callback func(any)) (*ConfigStructBinding, error) {
+func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path string, structPtr any, callback func(any)) (*ConfigStructBinding, error) {
 	// Validate the struct pointer
 	if structPtr == nil {
 		return nil, FormatError(ErrCodeInvalidInput, errors.New("structPtr cannot be nil"), "")
@@ -610,14 +623,14 @@ func (c *configServiceImpl) BindStructWithCallback(ctx context.Context, path str
 	}
 
 	// Do the initial loading
-	err := c.loadStructFromZk(ctx, binding.Path, env, namespace, binding)
+	err := c.loadStructFromZk(ctx, binding.Path, binding)
 	if err != nil {
 		return nil, FormatError(ErrCodeInternal, err, "failed to load initial configuration")
 	}
 
 	// Subscribe to changes
 	handler := func(event ConfigChangeEvent) {
-		err := c.loadStructFromZk(ctx, event.Path, env, namespace, binding)
+		err := c.loadStructFromZk(ctx, event.Path, binding)
 		if err != nil {
 			// Log error but don't fail the subscription
 			fmt.Printf("Error updating struct: %v\n", err)
@@ -661,12 +674,12 @@ func (c *configServiceImpl) UnbindStruct(binding *ConfigStructBinding) error {
 }
 
 // ReloadStruct manually reloads a struct from the current configuration
-func (c *configServiceImpl) ReloadStruct(ctx context.Context, env string, namespace string, binding *ConfigStructBinding) error {
+func (c *configServiceImpl) ReloadStruct(ctx context.Context, binding *ConfigStructBinding) error {
 	if binding == nil {
 		return FormatError(ErrCodeInvalidInput, errors.New("binding cannot be nil"), "")
 	}
 
-	err := c.loadStructFromZk(ctx, binding.Path, env, namespace, binding)
+	err := c.loadStructFromZk(ctx, binding.Path, binding)
 	if err != nil {
 		return FormatError(ErrCodeInternal, err, "failed to reload struct")
 	}
@@ -679,12 +692,12 @@ func (c *configServiceImpl) ReloadStruct(ctx context.Context, env string, namesp
 }
 
 // loadStructFromZk loads configuration data from ZooKeeper into a struct
-func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, env string, namespace string, binding *ConfigStructBinding) error {
+func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, binding *ConfigStructBinding) error {
 	binding.mu.Lock()
 	defer binding.mu.Unlock()
 
 	// Export all configs under the path
-	configs, err := c.Export(ctx, path, env, namespace)
+	configs, err := c.Export(ctx, path)
 	if err != nil {
 		return FormatError(ErrCodeInternal, err, "failed to export configs")
 	}
@@ -695,8 +708,8 @@ func (c *configServiceImpl) loadStructFromZk(ctx context.Context, path string, e
 		// Remove the binding path prefix to get the relative path
 		relPath := strings.TrimPrefix(configPath, binding.Path)
 		relPath = strings.TrimPrefix(relPath, "/")
-		relPath = strings.TrimPrefix(relPath, namespace+c.delimiter)
-		relPath = strings.TrimPrefix(relPath, env+c.delimiter)
+		relPath = strings.TrimPrefix(relPath, c.Namespace+c.delimiter)
+		relPath = strings.TrimPrefix(relPath, c.Environment+c.delimiter)
 		relPath = strings.TrimPrefix(relPath, "global"+c.delimiter)
 
 		// Handle empty path (root config)
@@ -750,7 +763,7 @@ func (c *configServiceImpl) Close() error {
 }
 
 // SetFromStruct sets configuration values from a struct.
-func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env string, namespace string, structPtr any) error {
+func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, structPtr any) error {
 	// Validate the struct pointer
 	if structPtr == nil {
 		return FormatError(ErrCodeInvalidInput, errors.New("structPtr cannot be nil"), "")
@@ -784,14 +797,14 @@ func (c *configServiceImpl) SetFromStruct(ctx context.Context, path string, env 
 
 	// Flatten the settings map with custom delimiter "::" and base path.
 	zkConfigs := make(map[string]any)
-	c.flattenMap("", settings, zkConfigs, path, env, namespace)
+	c.flattenMap("", settings, zkConfigs, path)
 
 	// Use SetBatch to set all configurations.
 	return c.SetBatch(ctx, zkConfigs)
 }
 
 // flattenMap recursively flattens the nested map with proper path prefixing
-func (c *configServiceImpl) flattenMap(prefix string, input map[string]any, output map[string]any, basePath string, env string, namespace string) {
+func (c *configServiceImpl) flattenMap(prefix string, input map[string]any, output map[string]any, basePath string) {
 	for k, v := range input {
 		key := k
 		if prefix != "" {
@@ -804,9 +817,9 @@ func (c *configServiceImpl) flattenMap(prefix string, input map[string]any, outp
 		}
 
 		if subMap, isMap := v.(map[string]any); isMap {
-			c.flattenMap(key, subMap, output, basePath, env, namespace)
+			c.flattenMap(key, subMap, output, basePath)
 		} else {
-			output[namespace+c.delimiter+env+c.delimiter+fullPath] = v
+			output[c.Namespace+c.delimiter+c.Environment+c.delimiter+fullPath] = v
 		}
 	}
 }
